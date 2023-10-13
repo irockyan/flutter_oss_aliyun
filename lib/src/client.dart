@@ -8,6 +8,7 @@ import 'package:flutter_oss_aliyun/src/extension/file_extension.dart';
 import 'package:flutter_oss_aliyun/src/model/callback.dart';
 import 'package:flutter_oss_aliyun/src/model/request.dart';
 import 'package:flutter_oss_aliyun/src/model/request_option.dart';
+import 'package:xml/xml.dart';
 
 import 'extension/option_extension.dart';
 import 'http_mixin.dart';
@@ -43,6 +44,8 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
     final authGet = authGetter ??
         () async {
           final response = await _dio.get<dynamic>(stsUrl!);
+          print("看----");
+          print(response);
           return Auth.fromJson(response.data!);
         };
     _instance = Client._(endpoint: ossEndpoint, bucketName: bucketName)
@@ -674,5 +677,99 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
     }).toList();
 
     return await Future.wait(deletes);
+  }
+
+  /// 初始化一个切片上传接口
+  initMultipartUpload(
+    String filePath, {
+    PutRequestOption? option,
+    CancelToken? cancelToken,
+    String? fileKey,
+  }) async {
+    final String filename = filePath.split('/').last;
+    final String bucket = option?.bucketName ?? bucketName;
+    final Map<String, dynamic> internalHeaders = {
+      'content-type': contentType(filename),
+      'x-oss-forbid-overwrite': option.forbidOverride,
+      'x-oss-object-acl': option.acl,
+      'x-oss-storage-class': option.storage,
+    };
+
+    final Auth auth = await getAuth();
+
+    final Callback? callback = option?.callback;
+
+    final Map<String, dynamic> externalHeaders = option?.headers ?? {};
+    final Map<String, dynamic> headers = {
+      ...internalHeaders,
+      if (callback != null) ...callback.toHeaders(),
+      ...externalHeaders
+    };
+
+    final String url = "https://$bucket.$endpoint/$filePath?uploads";
+
+    final HttpRequest request = HttpRequest.post(url, headers: headers);
+
+    // 此处是重点，要不然签名不对
+    auth.sign(request, bucket, "$filePath?uploads");
+
+    final result = await _dio.post(request.url,
+        options: Options(headers: request.headers), data: "");
+
+    final xml = XmlDocument.parse(result.data ?? "");
+    final uploadIdList = xml.findAllElements("UploadId");
+
+    return uploadIdList.first.innerText;
+  }
+
+  /// 上传分片
+  uploadPart(String filePath,
+      {int? partNumber,
+      String? filepath,
+      String? uploadId,
+      PutRequestOption? option,
+      CancelToken? cancelToken,
+      dynamic data}) async {
+    final String bucket = option?.bucketName ?? bucketName;
+    final String filename = filePath.split('/').last;
+    final Auth auth = await getAuth();
+
+    final Callback? callback = option?.callback;
+
+    final Map<String, dynamic> internalHeaders = {
+      'content-type': contentType(filename),
+      'x-oss-forbid-overwrite': option.forbidOverride,
+      'x-oss-object-acl': option.acl,
+      'x-oss-storage-class': option.storage,
+    };
+
+    final Map<String, dynamic> externalHeaders = option?.headers ?? {};
+    final Map<String, dynamic> headers = {
+      ...internalHeaders,
+      if (callback != null) ...callback.toHeaders(),
+      ...externalHeaders
+    };
+
+    final String url =
+        "https://$bucket.$endpoint/$filePath?partNumber=$partNumber&uploadId=$uploadId";
+
+    final HttpRequest request = HttpRequest.put(url, headers: headers);
+
+    auth.sign(
+        request, bucket, "$filePath?partNumber=$partNumber&uploadId=$uploadId");
+
+    final MultipartFile multipartFile = await MultipartFile.fromFile(
+      filepath ?? "",
+      filename: filename,
+    );
+
+    return _dio.put(
+      request.url,
+      data: multipartFile.chunk(),
+      options: Options(headers: request.headers),
+      cancelToken: cancelToken,
+      onSendProgress: option?.onSendProgress,
+      onReceiveProgress: option?.onReceiveProgress,
+    );
   }
 }
