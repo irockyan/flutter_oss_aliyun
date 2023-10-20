@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:js_util';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
@@ -333,7 +334,7 @@ void main() {
     final String url = await Client().getSignedUrl("test.csv");
     print("download url = $url");
 
-    expect(url, isNotNull);
+    expect(url, not(null));
   });
 
   test("test the get object urls in Client", () async {

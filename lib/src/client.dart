@@ -1,4 +1,8 @@
 import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 import 'package:flutter_oss_aliyun/src/auth_mixin.dart';
@@ -8,6 +12,7 @@ import 'package:flutter_oss_aliyun/src/extension/file_extension.dart';
 import 'package:flutter_oss_aliyun/src/model/callback.dart';
 import 'package:flutter_oss_aliyun/src/model/request.dart';
 import 'package:flutter_oss_aliyun/src/model/request_option.dart';
+import 'package:flutter_oss_aliyun/src/model/response.dart';
 import 'package:xml/xml.dart';
 
 import 'extension/option_extension.dart';
@@ -16,6 +21,32 @@ import 'model/asset_entity.dart';
 import 'model/auth.dart';
 import 'model/enums.dart';
 import 'util/dio_client.dart';
+import 'package:path/path.dart' as path2;
+
+class AliyunOssPart {
+  int partNumber;
+  String etag;
+  int start;
+  int end;
+  int uploadedLength;
+  AliyunOssPart(this.partNumber, this.etag,
+      {required this.start, required this.end, required this.uploadedLength});
+}
+
+class AliyunOssPartConfig {
+  /// 分块大小
+  int partSize;
+
+  /// 并发数
+  int concurrentNumber;
+
+  /// 重试次数
+  int leftRetryNumber;
+  AliyunOssPartConfig(
+      {this.partSize = 1024 * 1024,
+      this.concurrentNumber = 10,
+      this.leftRetryNumber = 3});
+}
 
 class Client with AuthMixin, HttpMixin implements ClientApi {
   static Client? _instance;
@@ -24,6 +55,34 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
 
   final String endpoint;
   final String bucketName;
+
+  List<Future<AliyunOssPart>> futureParts = [];
+
+  /// 原始切片数据
+  List<AliyunOssPart> originParts = [];
+  var theUploadId = "";
+
+  /// objectName
+  String _objectName = "";
+
+  // 上传配置
+  PutRequestOption? _option;
+
+  /// 文件总大小
+  int _contentLength = 0;
+
+  /// 已上传文件的大小
+  int _uploadedLength = 0;
+
+  /// 分片配置
+  AliyunOssPartConfig partConfig = AliyunOssPartConfig();
+
+  /// 正在进行中的上传切片
+  List<AliyunOssPart> uploadingParts = [];
+
+  /// 当前状态
+  var status = AliyunOssUploadStatus.prepare;
+
   static late Dio _dio;
 
   Client._({
@@ -44,12 +103,11 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
     final authGet = authGetter ??
         () async {
           final response = await _dio.get<dynamic>(stsUrl!);
-          print("看----");
-          print(response);
           return Auth.fromJson(response.data!);
         };
     _instance = Client._(endpoint: ossEndpoint, bucketName: bucketName)
       ..authGetter = authGet;
+    _instance?._objectName = stsUrl!;
     return _instance!;
   }
 
@@ -679,8 +737,9 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
     return await Future.wait(deletes);
   }
 
-  /// 初始化一个切片上传接口
-  initMultipartUpload(
+  /// 初始化切片上传接口
+  /// [return] uploadId
+  Future<AliyunOssResponse<String>> initMultipartUpload(
     String filePath, {
     PutRequestOption? option,
     CancelToken? cancelToken,
@@ -713,22 +772,27 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
     // 此处是重点，要不然签名不对
     auth.sign(request, bucket, "$filePath?uploads");
 
-    final result = await _dio.post(request.url,
-        options: Options(headers: request.headers), data: "");
-
-    final xml = XmlDocument.parse(result.data ?? "");
-    final uploadIdList = xml.findAllElements("UploadId");
-
-    return uploadIdList.first.innerText;
+    try {
+      final result = await _dio.post(request.url,
+          options: Options(headers: request.headers), data: "");
+      final xml = XmlDocument.parse(result.data ?? "");
+      final uploadIdList = xml.findAllElements("UploadId");
+      return AliyunOssResponse(uploadIdList.first.innerText,
+          code: AliyunOssResponseStatus.success);
+    } catch (e) {
+      return AliyunOssResponse("",
+          code: AliyunOssResponseStatus.fail, msg: "$e");
+    }
   }
 
   /// 上传分片
-  uploadPart(String filePath,
-      {int? partNumber,
-      String? filepath,
+  Future<AliyunOssPart> uploadPart(String filePath,
+      {required int partNumber,
       String? uploadId,
       PutRequestOption? option,
       CancelToken? cancelToken,
+      required int start,
+      required int end,
       dynamic data}) async {
     final String bucket = option?.bucketName ?? bucketName;
     final String filename = filePath.split('/').last;
@@ -738,9 +802,9 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
 
     final Map<String, dynamic> internalHeaders = {
       'content-type': contentType(filename),
+      'content-length': (end > _contentLength ? _contentLength : end) - start,
       'x-oss-forbid-overwrite': option.forbidOverride,
       'x-oss-object-acl': option.acl,
-      // 'x-oss-storage-class': option.storage,
     };
 
     final Map<String, dynamic> externalHeaders = option?.headers ?? {};
@@ -758,18 +822,305 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
     auth.sign(
         request, bucket, "$filePath?partNumber=$partNumber&uploadId=$uploadId");
 
-    final MultipartFile multipartFile = await MultipartFile.fromFile(
-      filepath ?? "",
-      filename: filename,
-    );
-
-    return _dio.put(
-      request.url,
-      data: multipartFile.chunk(),
-      options: Options(headers: request.headers),
-      cancelToken: cancelToken,
-      onSendProgress: option?.onSendProgress,
-      onReceiveProgress: option?.onReceiveProgress,
-    );
+    try {
+      final res = await _dio.put(
+        request.url,
+        data: data,
+        options: Options(headers: request.headers),
+        cancelToken: cancelToken,
+        onSendProgress: (count, total) {
+          _option?.onSendProgress?.call(_uploadedLength, _contentLength);
+        },
+        onReceiveProgress: (count, total) {
+          print("下载中");
+        },
+      );
+      return AliyunOssPart(partNumber, res.headers["etag"]?[0] ?? "",
+          start: start, end: end, uploadedLength: 0);
+    } catch (e) {
+      return AliyunOssPart(partNumber, "",
+          start: start, end: end, uploadedLength: 0);
+      ;
+    }
   }
+
+  /// 上传分片
+  Future<AliyunOssPart> _uploadPart(String filePath,
+      {required AliyunOssPart part,
+      String? uploadId,
+      PutRequestOption? option,
+      CancelToken? cancelToken,
+      dynamic data}) async {
+    final end = part.end;
+    final start = part.start;
+    final partNumber = part.partNumber;
+    final String bucket = option?.bucketName ?? bucketName;
+    final String filename = filePath.split('/').last;
+    final Auth auth = await getAuth();
+
+    final Callback? callback = option?.callback;
+
+    final Map<String, dynamic> internalHeaders = {
+      'content-type': contentType(filename),
+      'content-length': (end > _contentLength ? _contentLength : end) - start,
+      'x-oss-forbid-overwrite': option.forbidOverride,
+      'x-oss-object-acl': option.acl,
+    };
+
+    final Map<String, dynamic> externalHeaders = option?.headers ?? {};
+    final Map<String, dynamic> headers = {
+      ...internalHeaders,
+      if (callback != null) ...callback.toHeaders(),
+      ...externalHeaders
+    };
+
+    final String url =
+        "https://$bucket.$endpoint/$filePath?partNumber=$partNumber&uploadId=$uploadId";
+
+    final HttpRequest request = HttpRequest.put(url, headers: headers);
+
+    auth.sign(
+        request, bucket, "$filePath?partNumber=$partNumber&uploadId=$uploadId");
+
+    try {
+      final res = await _dio.put(
+        request.url,
+        data: data,
+        options: Options(headers: request.headers),
+        cancelToken: cancelToken,
+        onSendProgress: (count, total) {
+          part.uploadedLength = count;
+          _calculatorUploadedSize();
+        },
+        onReceiveProgress: (count, total) {
+          print("下载中");
+        },
+      );
+      return AliyunOssPart(partNumber, res.headers["etag"]?[0] ?? "",
+          start: start, end: end, uploadedLength: 0);
+    } catch (e) {
+      return AliyunOssPart(partNumber, "",
+          start: start, end: end, uploadedLength: 0);
+    }
+  }
+
+  Future<String> completeMultipartUpload(String filePath,
+      {required List<AliyunOssPart> parts,
+      int? partNumber,
+      String? uploadId,
+      PutRequestOption? option,
+      CancelToken? cancelToken,
+      dynamic data}) async {
+    final sb = StringBuffer();
+    sb.write('<CompleteMultipartUpload>');
+    for (final part in parts) {
+      sb.write("<Part>");
+      sb.write("<PartNumber>${part.partNumber}</PartNumber>");
+      sb.write("<ETag>${part.etag}</ETag>");
+      sb.write("</Part>");
+    }
+    sb.write('</CompleteMultipartUpload>');
+    final xml = XmlDocument.parse(sb.toString()).toXmlString(pretty: true);
+
+    final rawData = Uint8List.fromList(utf8.encode(xml));
+    final data = Stream.fromIterable(
+        Uint8List.fromList(utf8.encode(xml)).map((e) => [e]));
+    final String filename = filePath.split('/').last;
+    final String bucket = option?.bucketName ?? bucketName;
+    final Map<String, dynamic> internalHeaders = {
+      'content-type': contentType(filename),
+      'x-oss-forbid-overwrite': option.forbidOverride,
+      'x-oss-object-acl': option.acl,
+    };
+
+    final Auth auth = await getAuth();
+
+    final Callback? callback = option?.callback;
+
+    final Map<String, dynamic> externalHeaders = option?.headers ?? {};
+    final Map<String, dynamic> headers = {
+      ...internalHeaders,
+      if (callback != null) ...callback.toHeaders(),
+      ...externalHeaders
+    };
+
+    final String url = "https://$bucket.$endpoint/$filePath?uploadId=$uploadId";
+    final HttpRequest request = HttpRequest.post(url, headers: headers);
+
+    // 此处是重点，要不然签名不对
+    auth.sign(request, bucket, "$filePath?uploadId=$uploadId");
+
+    try {
+      final result = await _dio.post(request.url,
+          options: Options(headers: request.headers), data: data);
+      final xml = XmlDocument.parse(result.data ?? "");
+      final uploadIdList = xml.findAllElements("Location");
+      return uploadIdList.first.innerText;
+    } catch (e) {
+      return "";
+    }
+  }
+
+  /// 综合上传接口, 使用前需要配置签名等信息
+  ///
+  /// [return] 返回一个uploadId，用于暂停/重启
+  uploadMultipart(
+    String filePath, {
+    PutRequestOption? option,
+    CancelToken? cancelToken,
+  }) async {
+    _option = option;
+    _uploadedLength = 0;
+    // 首先初始化容器
+    final basename = path2.basename(filePath);
+    final filename = "${DateTime.now().millisecondsSinceEpoch}-$basename";
+    originParts = [];
+    final result = await initMultipartUpload(_objectName);
+    theUploadId = result.data ?? "";
+    print("分片初始化成功$theUploadId");
+    // 对路径进行切片
+    final file = File(filePath);
+    // 计算文件大小
+    final contentLength = await file.length();
+    _contentLength = contentLength;
+    print("文件大小$contentLength");
+
+    // 进行分片
+    originParts = _calculateParts(contentLength);
+    print("分片数据$originParts");
+    // 进行并发上传
+    await controlConcurrent(filePath);
+
+    // 确认上传
+    _detectPartUploaded(futureParts);
+  }
+
+  /// 控制并发请求
+  controlConcurrent(
+    String filePath,
+  ) async {
+    final tempConcurrentNumber = partConfig.concurrentNumber;
+    for (var i = 0; i < (originParts.length ~/ tempConcurrentNumber) + 1; i++) {
+      final temp = readAndUploading(
+        filePath,
+        left: i * tempConcurrentNumber,
+        right: (i + 1) * tempConcurrentNumber > originParts.length
+            ? originParts.length
+            : (i + 1) * tempConcurrentNumber,
+      );
+      await Future.wait(temp);
+    }
+  }
+
+  /// 进行并发上传
+  readAndUploading(
+    String filePath, {
+    required int left,
+    required int right,
+  }) {
+    if (status == AliyunOssUploadStatus.pause) {
+      return;
+    }
+    List<Future<AliyunOssPart>> tempFutures = [];
+
+    for (var i = left; i < right; i++) {
+      print("看是多少$i");
+      final e = originParts[i];
+      dynamic data = File(filePath).openRead(e.start, e.end);
+      final future = _uploadPart(
+        _objectName,
+        part: e,
+        uploadId: theUploadId,
+        data: data,
+      );
+      tempFutures.add(future);
+      futureParts.add(future);
+    }
+
+    return tempFutures;
+  }
+
+  /// 计算分片数据
+  _calculateParts(int length) {
+    List<AliyunOssPart> tempList = [];
+    final partLenght = partConfig.partSize;
+    for (var i = 0; i < ((length ~/ partLenght) + 1); i++) {
+      final partRangeStart = i * partLenght;
+
+      tempList.add(AliyunOssPart(i + 1, "",
+          start: partRangeStart,
+          end: partRangeStart + partLenght,
+          uploadedLength: 0));
+    }
+    return tempList;
+  }
+
+  Future<String?> _detectPartUploaded(
+    List<Future<AliyunOssPart>> tempFutureParts,
+  ) async {
+    final parts = await Future.wait(tempFutureParts);
+    print("这里执行的早了${parts.length}");
+
+    for (var element in originParts) {
+      final filter = parts.where(
+        (p) => p.partNumber == element.partNumber,
+      );
+      if (filter.isNotEmpty) {
+        element.etag = filter.first.etag;
+      }
+    }
+
+    final tempParts = parts.where((element) => element.etag == "").toList();
+    if (tempParts.isEmpty) {
+      print("确定上传");
+      final res = await _partUploadComplete(parts);
+      return res;
+    } else {
+      print("开始重试");
+      if (partConfig.leftRetryNumber == 0) {
+        return null;
+      } else {
+        futureParts = [];
+        for (var element in tempParts) {
+          uploadPart(_objectName,
+              partNumber: element.partNumber,
+              start: element.start,
+              end: element.end);
+        }
+        partConfig.leftRetryNumber--;
+        return _detectPartUploaded(futureParts);
+      }
+    }
+  }
+
+  Future<String?> _partUploadComplete(
+    List<AliyunOssPart> parts,
+  ) async {
+    try {
+      parts.sort(
+        (a, b) => a.partNumber - b.partNumber,
+      );
+      final res = await Client().completeMultipartUpload(_objectName,
+          parts: parts, uploadId: theUploadId);
+      return res;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  /// 计算上传大小
+  _calculatorUploadedSize() {
+    final uploadedLength = originParts.fold<int>(
+        0, (previousValue, element) => previousValue + element.uploadedLength);
+
+    _option?.onSendProgress?.call(uploadedLength, _contentLength);
+  }
+
+  /// 暂停上传
+  pauseTask() {
+    status = AliyunOssUploadStatus.pause;
+  }
+
+  /// 继续上传
+  resumeTask() {}
 }

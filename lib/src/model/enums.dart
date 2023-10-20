@@ -29,3 +29,7 @@ enum CalbackBodyType {
 
   const CalbackBodyType(this.contentType);
 }
+
+enum AliyunOssResponseStatus { success, fail }
+
+enum AliyunOssUploadStatus { prepare, pause, uploading, finish }
