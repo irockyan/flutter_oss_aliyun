@@ -802,7 +802,6 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
 
     final Map<String, dynamic> internalHeaders = {
       'content-type': contentType(filename),
-      'content-length': (end > _contentLength ? _contentLength : end) - start,
       'x-oss-forbid-overwrite': option.forbidOverride,
       'x-oss-object-acl': option.acl,
     };
