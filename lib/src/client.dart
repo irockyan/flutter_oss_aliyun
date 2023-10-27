@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
@@ -71,8 +70,8 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
   /// 文件总大小
   int _contentLength = 0;
 
-  /// 已上传文件的大小
-  int _uploadedLength = 0;
+  /// 文件总大小
+  String _filePath = "";
 
   /// 分片配置
   AliyunOssPartConfig partConfig = AliyunOssPartConfig();
@@ -827,9 +826,6 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
         data: data,
         options: Options(headers: request.headers),
         cancelToken: cancelToken,
-        onSendProgress: (count, total) {
-          _option?.onSendProgress?.call(_uploadedLength, _contentLength);
-        },
         onReceiveProgress: (count, total) {
           print("下载中");
         },
@@ -885,7 +881,10 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
       final res = await _dio.put(
         request.url,
         data: data,
-        options: Options(headers: request.headers),
+        options: Options(
+            headers: request.headers,
+            sendTimeout: const Duration(milliseconds: 60000),
+            receiveTimeout: const Duration(milliseconds: 60000)),
         cancelToken: cancelToken,
         onSendProgress: (count, total) {
           part.uploadedLength = count;
@@ -969,10 +968,7 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
     CancelToken? cancelToken,
   }) async {
     _option = option;
-    _uploadedLength = 0;
     // 首先初始化容器
-    final basename = path2.basename(filePath);
-    final filename = "${DateTime.now().millisecondsSinceEpoch}-$basename";
     originParts = [];
     final result = await initMultipartUpload(_objectName);
     theUploadId = result.data ?? "";
@@ -984,36 +980,36 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
     _contentLength = contentLength;
     print("文件大小$contentLength");
 
+    _filePath = filePath;
+
     // 进行分片
     originParts = _calculateParts(contentLength);
     print("分片数据$originParts");
     // 进行并发上传
-    await controlConcurrent(filePath);
-
-    // 确认上传
-    _detectPartUploaded(futureParts);
+    return await controlConcurrent(originParts);
   }
 
   /// 控制并发请求
-  controlConcurrent(
-    String filePath,
-  ) async {
+  controlConcurrent(List<AliyunOssPart> parts) async {
     final tempConcurrentNumber = partConfig.concurrentNumber;
-    for (var i = 0; i < (originParts.length ~/ tempConcurrentNumber) + 1; i++) {
+    for (var i = 0; i < (parts.length ~/ tempConcurrentNumber) + 1; i++) {
       final temp = readAndUploading(
-        filePath,
+        _filePath,
+        parts: parts,
         left: i * tempConcurrentNumber,
-        right: (i + 1) * tempConcurrentNumber > originParts.length
-            ? originParts.length
+        right: (i + 1) * tempConcurrentNumber > parts.length
+            ? parts.length
             : (i + 1) * tempConcurrentNumber,
       );
       await Future.wait(temp);
     }
+    return _detectPartUploaded(futureParts);
   }
 
   /// 进行并发上传
   readAndUploading(
     String filePath, {
+    required List<AliyunOssPart> parts,
     required int left,
     required int right,
   }) {
@@ -1023,8 +1019,7 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
     List<Future<AliyunOssPart>> tempFutures = [];
 
     for (var i = left; i < right; i++) {
-      print("看是多少$i");
-      final e = originParts[i];
+      final e = parts[i];
       dynamic data = File(filePath).openRead(e.start, e.end);
       final future = _uploadPart(
         _objectName,
@@ -1058,7 +1053,6 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
     List<Future<AliyunOssPart>> tempFutureParts,
   ) async {
     final parts = await Future.wait(tempFutureParts);
-    print("这里执行的早了${parts.length}");
 
     for (var element in originParts) {
       final filter = parts.where(
@@ -1071,23 +1065,24 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
 
     final tempParts = parts.where((element) => element.etag == "").toList();
     if (tempParts.isEmpty) {
-      print("确定上传");
-      final res = await _partUploadComplete(parts);
+      print("重试之正常确认结果");
+      print("重试之正常确认结果${originParts.length}");
+      final aa = originParts.where((element) => element.etag == "").toList();
+      print("重试之正常确认结果${aa.length}");
+      final res = await _partUploadComplete(originParts);
       return res;
     } else {
-      print("开始重试");
-      if (partConfig.leftRetryNumber == 0) {
+      if (partConfig.leftRetryNumber <= 0) {
+        print("重试完毕");
         return null;
       } else {
         futureParts = [];
-        for (var element in tempParts) {
-          uploadPart(_objectName,
-              partNumber: element.partNumber,
-              start: element.start,
-              end: element.end);
-        }
-        partConfig.leftRetryNumber--;
-        return _detectPartUploaded(futureParts);
+        print("重试剩余次数${partConfig.leftRetryNumber}");
+        return await Future.delayed(const Duration(milliseconds: 2000),
+            () async {
+          partConfig.leftRetryNumber--;
+          return await await controlConcurrent(tempParts);
+        });
       }
     }
   }
@@ -1111,7 +1106,10 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
   _calculatorUploadedSize() {
     final uploadedLength = originParts.fold<int>(
         0, (previousValue, element) => previousValue + element.uploadedLength);
-
+    // var has = uploadedLength;
+    // if (has >= _contentLength) {
+    //   has = _contentLength;
+    // }
     _option?.onSendProgress?.call(uploadedLength, _contentLength);
   }
 
@@ -1121,5 +1119,17 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
   }
 
   /// 继续上传
-  resumeTask() {}
+  resumeTask(
+    String uploadId, {
+    PutRequestOption? option,
+  }) {
+    partConfig.leftRetryNumber = 3;
+    theUploadId = uploadId;
+    _option = option;
+
+    /// 找当前还未上传的parts
+    final tempParts =
+        originParts.where((element) => element.etag == "").toList();
+    return controlConcurrent(tempParts);
+  }
 }
