@@ -950,10 +950,18 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
 
     try {
       final result = await _dio.post(request.url,
-          options: Options(headers: request.headers), data: data);
-      final xml = XmlDocument.parse(result.data ?? "");
-      final uploadIdList = xml.findAllElements("Location");
-      return uploadIdList.first.innerText;
+          options: Options(
+              headers: request.headers, responseType: ResponseType.plain),
+          data: data);
+      if (result.statusCode != null &&
+          result.statusCode! >= 200 &&
+          result.statusCode! <= 300) {
+        final xml = XmlDocument.parse(result.data ?? "");
+        final uploadIdList = xml.findAllElements("Location");
+        return uploadIdList.first.innerText;
+      } else {
+        return "";
+      }
     } catch (e) {
       return "";
     }
@@ -1065,19 +1073,13 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
 
     final tempParts = parts.where((element) => element.etag == "").toList();
     if (tempParts.isEmpty) {
-      print("重试之正常确认结果");
-      print("重试之正常确认结果${originParts.length}");
-      final aa = originParts.where((element) => element.etag == "").toList();
-      print("重试之正常确认结果${aa.length}");
       final res = await _partUploadComplete(originParts);
       return res;
     } else {
       if (partConfig.leftRetryNumber <= 0) {
-        print("重试完毕");
         return null;
       } else {
         futureParts = [];
-        print("重试剩余次数${partConfig.leftRetryNumber}");
         return await Future.delayed(const Duration(milliseconds: 2000),
             () async {
           partConfig.leftRetryNumber--;
@@ -1094,7 +1096,7 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
       parts.sort(
         (a, b) => a.partNumber - b.partNumber,
       );
-      final res = await Client().completeMultipartUpload(_objectName,
+      final res = await completeMultipartUpload(_objectName,
           parts: parts, uploadId: theUploadId);
       return res;
     } catch (e) {
@@ -1126,6 +1128,8 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
     partConfig.leftRetryNumber = 3;
     theUploadId = uploadId;
     _option = option;
+
+    futureParts = [];
 
     /// 找当前还未上传的parts
     final tempParts =
