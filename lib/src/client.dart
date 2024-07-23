@@ -824,7 +824,10 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
       final res = await _dio.put(
         request.url,
         data: data,
-        options: Options(headers: request.headers),
+        options: Options(
+            headers: request.headers,
+            sendTimeout: const Duration(seconds: 300),
+            receiveTimeout: const Duration(seconds: 120)),
         cancelToken: cancelToken,
         onReceiveProgress: (count, total) {
           print("下载中");
@@ -835,7 +838,6 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
     } catch (e) {
       return AliyunOssPart(partNumber, "",
           start: start, end: end, uploadedLength: 0);
-      ;
     }
   }
 
@@ -877,14 +879,15 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
     auth.sign(
         request, bucket, "$filePath?partNumber=$partNumber&uploadId=$uploadId");
 
+    print("测试时间-开始-$partNumber-${DateTime.now()}");
     try {
       final res = await _dio.put(
         request.url,
         data: data,
         options: Options(
             headers: request.headers,
-            sendTimeout: const Duration(milliseconds: 60000),
-            receiveTimeout: const Duration(milliseconds: 60000)),
+            sendTimeout: const Duration(milliseconds: 600000),
+            receiveTimeout: const Duration(milliseconds: 600000)),
         cancelToken: cancelToken,
         onSendProgress: (count, total) {
           part.uploadedLength = count;
@@ -894,9 +897,11 @@ class Client with AuthMixin, HttpMixin implements ClientApi {
           print("下载中");
         },
       );
+      print("测试时间-结束-$partNumber-${DateTime.now()}");
       return AliyunOssPart(partNumber, res.headers["etag"]?[0] ?? "",
           start: start, end: end, uploadedLength: 0);
     } catch (e) {
+      print("测试时间-超时-$partNumber-${DateTime.now()}");
       return AliyunOssPart(partNumber, "",
           start: start, end: end, uploadedLength: 0);
     }
